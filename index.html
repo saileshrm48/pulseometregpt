@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-  <title>PulseCam — Stable BPM via Phone Camera (v2.2)</title>
+  <title>PulseCam — Stable BPM via Phone Camera (v2.3)</title>
   <meta name="theme-color" content="#0ea5e9" />
   <style>
     :root { --bg:#0b1220; --card:#0f172a; --muted:#94a3b8; --text:#e2e8f0; --accent:#22d3ee; --good:#34d399; --warn:#fbbf24; --bad:#f87171; }
@@ -35,8 +35,8 @@
   <div class="wrap">
     <header>
       <div>
-        <h1>PulseCam <span class="pill">PPG v2.2</span></h1>
-        <div class="sub">Stabilized BPM with proper resampling, green-ROI, SQI, and outlier rejection. HTTPS required.</div>
+        <h1>PulseCam <span class="pill">PPG v2.3</span></h1>
+        <div class="sub">Stabilized BPM with proper resampling, green-ROI, SQI, gating, and outlier rejection. HTTPS required.</div>
       </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button id="startBtn" class="btn" type="button">▶ Start</button>
@@ -98,8 +98,8 @@
   let v, preview, ctx, cvs, drawCtx, drawCvs;
   let rafId=null, procId=null, estId=null;
 
-  // Dynamic target sample rate for processing (we resample to this)
-  const RS = 30; // Hz, uniform grid for DSP
+  // Target sample rate (uniform grid for DSP)
+  const RS = 30; // Hz
   const BUFFER_SECS = 12; // seconds stored
   const MAX_RAW = RS * BUFFER_SECS * 4; // allow oversampling in raw ring
 
@@ -113,7 +113,7 @@
   const uniT = new Float64Array(UNIFORM_N);
   const uniY = new Float32Array(UNIFORM_N);
 
-  const bpmHist = []; const BPM_HIST_N = 7; // longer smoothing window
+  const bpmHist = []; const BPM_HIST_N = 7; // smoothing window
   let lastFrameTime = 0;
 
   // ===== UI helpers =====
@@ -126,21 +126,28 @@
     document.getElementById('qual').textContent = msg;
   }
 
-  // ===== Metrics =====
-  function coverageMetric(frame) { // % of red-dominant pixels
-    let redDominant = 0; const step = 4*8;
-    for (let i=0;i<frame.data.length;i+=step){
-      const r=frame.data[i], g=frame.data[i+1], b=frame.data[i+2];
-      if (r > g*1.2 && r > b*1.2) redDominant++;
-    }
-    return redDominant / (frame.data.length/step);
+  // ===== Metrics / SQI =====
+  function computeSQI(frameMean, frameStd, coverage, sat){
+    const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
+    const acdc = clamp((frameStd/Math.max(1e-3, frameMean)) * 5, 0, 1); // scale
+    const covf = clamp((coverage - 0.2)/0.6, 0, 1);
+    const satf = 1 - clamp((sat - 0.05)/0.3, 0, 1);
+    return clamp(0.2*acdc + 0.5*covf + 0.3*satf, 0, 1);
   }
-  function saturationMetric(frame){ // % of clipped red pixels
-    let sat = 0; const step = 4*8;
-    for (let i=0;i<frame.data.length;i+=step){
-      const r = frame.data[i]; if (r > 250) sat++;
+
+  function roiCoverageAndSaturation(frame, W, H, rx, ry, rw, rh) {
+    // Coverage: % pixels where GREEN is dominant (finger present) in ROI
+    let cover = 0, sat = 0, n = 0;
+    for (let y = ry; y < ry + rh; y++) {
+      for (let x = rx; x < rx + rw; x++) {
+        const i = (y * W + x) * 4;
+        const r = frame.data[i], g = frame.data[i + 1], b = frame.data[i + 2];
+        if (g > r * 1.1 && g > b * 1.1) cover++;
+        if (g >= 245) sat++;
+        n++;
+      }
     }
-    return sat / (frame.data.length/step);
+    return { coverage: n ? cover / n : 0, saturation: n ? sat / n : 0 };
   }
 
   // ===== DSP helpers =====
@@ -155,7 +162,7 @@
     }
   }
 
-  // 2nd‑order band‑pass on uniform grid (biquad) — fs=RS
+  // 2nd-order biquad — fs=RS
   class Biquad {
     constructor(type, fs, f0, Q){ this.type=type; this.fs=fs; this.set(f0,Q); this.x1=this.x2=this.y1=this.y2=0; }
     set(f0,Q){
@@ -170,8 +177,15 @@
     reset(){ this.x1=this.x2=this.y1=this.y2=0; }
   }
 
-  const bp1 = new Biquad('bandpass', RS, 1.5, 0.9); // ~90 BPM center
-  const bp2 = new Biquad('bandpass', RS, 2.0, 0.9); // ~120 BPM center — cascade gives broader passband
+  // Proper 0.5–3.0 Hz band (≈30–180 BPM)
+  const hp = new Biquad('highpass', RS, 0.5, 0.707);
+  const lp = new Biquad('lowpass',  RS, 3.0, 0.707);
+
+  function bandpassInPlace(){
+    hp.reset(); lp.reset();
+    const N = UNIFORM_N;
+    for (let i=0;i<N;i++){ uniY[i] = lp.process(hp.process(uniY[i])); }
+  }
 
   function pushSample(t, x){ times[wr]=t; samples[wr]=x; wr=(wr+1)%MAX_RAW; count=Math.min(count+1, MAX_RAW); }
 
@@ -181,16 +195,14 @@
     const now = performance.now()/1000;
     const dt = 1/RS;
     const start = now - (UNIFORM_N-1)*dt;
-    // fill target time axis
     for (let i=0;i<UNIFORM_N;i++){ uniT[i] = start + i*dt; }
 
-    // Walk through raw ring to find bracketing points
-    // Copy ring into a linear scratch (oldest->newest)
+    // Copy ring into linear (oldest->newest)
     const n = count; const bufT = new Float64Array(n); const bufY = new Float32Array(n);
     for (let i=0;i<n;i++){ const idx=(wr - n + i + MAX_RAW)%MAX_RAW; bufT[i]=times[idx]; bufY[i]=samples[idx]; }
 
     // Interpolate
-    let j=1; // buf index bracketing the current uniT
+    let j=1;
     for (let i=0;i<UNIFORM_N;i++){
       const t = uniT[i];
       while (j < n && bufT[j] < t) j++;
@@ -202,23 +214,6 @@
       uniY[i] = y1 + a*(y2 - y1);
     }
     return true;
-  }
-
-  // Simple spectral peak finder on uniform grid (Welch-like with Hann window)
-  function estimateFromSpectrum(){
-    // Detrend
-    detrendUniform(uniY, 1 - Math.exp(-2*Math.PI*0.5 / RS)); // ~0.5 Hz HP
-
-    // Band-pass
-    bp1.reset(); bp2.reset();
-    for (let i=0;i<UNIform_N_FIX(); i++){ /* placeholder */ }
-  }
-  function UNIform_N_FIX(){ return UNIFORM_N; } // tiny helper to allow minification‑safe looping inlined below
-
-  function bandpassInPlace(){
-    bp1.reset(); bp2.reset();
-    const N = UNIFORM_N;
-    for (let i=0;i<N;i++){ uniY[i] = bp2.process(bp1.process(uniY[i])); }
   }
 
   function autocorrPeak(){
@@ -252,35 +247,33 @@
     return { bpm, conf };
   }
 
-  // Signal Quality Index (AC/DC ratio * coverage factor * (1-saturation))
-  function computeSQI(frameMean, frameStd, coverage, sat){
-    const acdc = clamp((frameStd/Math.max(1e-3, frameMean)) * 5, 0, 1); // scale
-    const covf = clamp((coverage - 0.2)/0.6, 0, 1);
-    const satf = 1 - clamp((sat - 0.05)/0.3, 0, 1);
-    return clamp(0.2*acdc + 0.5*covf + 0.3*satf, 0, 1);
-  }
-
   // ===== Frame processing =====
   function processFrame(){
     if (!v.videoWidth) return;
     ctx.drawImage(v,0,0,cvs.width,cvs.height);
     const frame = ctx.getImageData(0,0,cvs.width,cvs.height);
 
-    const cov = coverageMetric(frame); setText('coverage', `Coverage: ${(cov*100|0)}%`);
-    const sat = saturationMetric(frame); setText('sat', `Saturation: ${(sat*100|0)}%`);
+    // ROI (center) and GREEN-channel stats
+    const W=cvs.width, H=cvs.height;
+    const rx=Math.floor(W*0.25), ry=Math.floor(H*0.25), rw=Math.floor(W*0.5), rh=Math.floor(H*0.5);
 
-    // Center ROI (reduce motion/edge leakage) — use GREEN channel (best SNR)
-    const W=cvs.width, H=cvs.height; const rx=Math.floor(W*0.25), ry=Math.floor(H*0.25), rw=Math.floor(W*0.5), rh=Math.floor(H*0.5);
     let sum=0, sum2=0, n=0;
     for (let y=ry;y<ry+rh;y++){
       for (let x=rx;x<rx+rw;x++){
-        const i=(y*W + x)*4; const g=frame.data[i+1]; sum+=g; sum2+=g*g; n++;
+        const i=(y*W + x)*4; const g=frame.data[i+1];
+        sum+=g; sum2+=g*g; n++;
       }
     }
-    const mean = sum/n; const std = Math.sqrt(Math.max(0, sum2/n - mean*mean));
+    const mean = n ? sum/n : 0;
+    const std = n ? Math.sqrt(Math.max(0, sum2/n - mean*mean)) : 0;
 
-    // Illumination normalization: convert to contrast signal
-    const raw = std / (mean + 1e-6);
+    // ROI-consistent coverage & saturation (GREEN dominance / clip)
+    const { coverage: cov, saturation: sat } = roiCoverageAndSaturation(frame, W, H, rx, ry, rw, rh);
+    setText('coverage', `Coverage: ${(cov*100|0)}%`);
+    setText('sat',       `Saturation: ${(sat*100|0)}%`);
+
+    // Illumination-invariant PPG proxy: spatial MEAN of GREEN (negated optional)
+    const raw = -mean;
 
     // Push with timestamp
     const now = performance.now()/1000;
@@ -290,20 +283,28 @@
     const dt = now - (lastFrameTime || now); lastFrameTime = now;
     const fps = 1/Math.max(dt, 1/120); setText('fr', 'FPS: ' + fps.toFixed(0));
 
-    // Quality hints
+    // Quality hints & SQI
     const sqi = computeSQI(mean, std, cov, sat); setText('sqi', 'SQI: ' + Math.round(sqi*100) + '%');
     if (cov < 0.25) setQuality('Poor','Cover the camera fully with your fingertip.');
-    else if (sat > 0.25) setQuality('Fair','Too bright; ease pressure or adjust finger.');
+    else if (sat > 0.35) setQuality('Fair','Too bright; ease pressure or adjust finger.');
     else if (fps < 20) setQuality('Fair','Low frame rate. Keep device cool/close apps.');
     else if (sqi < 0.35) setQuality('Fair','Hold steady and relax your finger.');
     else setQuality('Good','Hold steady. Breathe normally.');
+
+    // Gate: only allow estimation when basic conditions are good
+    processFrame.good = (cov >= 0.30) && (sat <= 0.35) && (sqi >= 0.35) && (fps >= 20);
   }
 
   // ===== BPM estimation on a 1 s cadence =====
   function estimateBPM(){
+    if (!processFrame.good){
+      document.getElementById('bpm').textContent = '—';
+      setText('conf', 'Confidence: 0%');
+      return;
+    }
     if (!resampleUniform()) return;
 
-    // Detrend + bandpass in place (0.7–3.0 Hz ~ 42–180 BPM)
+    // Detrend + bandpass in place (0.5–3.0 Hz ~ 30–180 BPM)
     detrendUniform(uniY, 1 - Math.exp(-2*Math.PI*0.5 / RS));
     bandpassInPlace();
 
@@ -314,14 +315,15 @@
       return;
     }
 
-    // Outlier rejection vs rolling median
+    // Outlier rejection vs rolling median (tighter guard)
     bpmHist.push(bpm); if (bpmHist.length > BPM_HIST_N) bpmHist.shift();
     const sorted=[...bpmHist].sort((a,b)=>a-b);
     const median = sorted[Math.floor(sorted.length/2)];
+    const isOutlier = Math.abs(bpm - median) > 12;
 
-    const isOutlier = Math.abs(bpm - median) > 20; // bpm jump guard
-    const alpha = 0.25; // smoothing
-    estimateBPM.smooth = (estimateBPM.smooth??bpm)*(1-alpha) + (isOutlier?median:bpm)*alpha;
+    // Confidence-weighted smoothing (faster when confidence high)
+    const alpha = clamp(0.1 + 0.5 * conf, 0.15, 0.55);
+    estimateBPM.smooth = (estimateBPM.smooth ?? bpm)*(1-alpha) + (isOutlier?median:bpm)*alpha;
     const finalBPM = Math.round(estimateBPM.smooth);
 
     const bounded = finalBPM>=40 && finalBPM<=180;
@@ -333,7 +335,6 @@
       setQuality('Poor','Unstable signal; adjust finger/lighting.');
       return;
     }
-
     document.getElementById('bpm').textContent = finalBPM;
   }
 
@@ -348,7 +349,6 @@
     ctx.stroke();
 
     ctx.beginPath(); ctx.lineWidth=2; ctx.strokeStyle='#7dd3fc';
-    // draw last 10s uniform
     const N=UNIFORM_N; if (N>2 && uniT[0]!==0){
       const t0=uniT[0];
       for (let i=0;i<N;i++){
@@ -365,7 +365,7 @@
   async function start(){
     if (stream) return;
     try{
-      // Constrain to small resolution and high frameRate to reduce exposure hunting
+      // Constrain to small resolution & higher frameRate to reduce exposure hunting
       const constraints = {
         video: {
           facingMode: { ideal: 'environment' },
@@ -384,7 +384,10 @@
         torchAvailable = true;
         document.getElementById('torchBtn').disabled = false;
         setText('torchState', 'Torch: available');
-        try{ await track.applyConstraints({ advanced:[{ torch:true }] }); torchOn=true; setText('torchState','Torch: on'); }catch(e){ log('Torch enable failed:', e.message); }
+        try{
+          await track.applyConstraints({ advanced:[{ torch:true }] });
+          torchOn=true; setText('torchState','Torch: on');
+        }catch(e){ log('Torch enable failed:', e.message); }
       } else {
         setText('torchState', 'Torch: not available');
       }
